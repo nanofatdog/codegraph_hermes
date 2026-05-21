@@ -34,6 +34,20 @@ answer. Reach for raw Read/Grep only to confirm a specific detail
 codegraph didn't cover. A direct codegraph answer is typically a handful
 of calls; a grep/read exploration is dozens.
 
+## Hermes Agent: use delegate_task for heavy exploration ONLY
+
+If you're running in Hermes Agent and the question requires inspecting
+many symbols across many files, spawn ONE \`delegate_task\` subagent with
+CodeGraph tools and this instruction:
+
+> "This project has CodeGraph (.codegraph/ exists). Use
+> codegraph_context as your PRIMARY tool — it returns entry points +
+> related symbols + source code in one call. Do NOT use grep/read_file
+> for exploration. Use codegraph_node for single symbol details."
+
+The main session should only call lightweight tools
+(codegraph_search, codegraph_callers, codegraph_impact) directly.
+
 ## Tool selection by intent
 
 - **"What is the symbol named X?"** → \`codegraph_search\`
