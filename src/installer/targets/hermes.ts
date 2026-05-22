@@ -263,7 +263,7 @@ function renderCodeGraphMcpChild(): string[] {
     '    args:',
     '      - serve',
     '      - --mcp',
-    '    timeout: 180',
+    '    timeout: 120',
     '    connect_timeout: 60',
     '    enabled: true',
   ];
