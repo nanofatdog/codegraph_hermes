@@ -75,6 +75,7 @@ export const LANGUAGES = [
   'c',
   'cpp',
   'csharp',
+  'razor',
   'php',
   'ruby',
   'swift',
@@ -87,8 +88,11 @@ export const LANGUAGES = [
   'scala',
   'lua',
   'luau',
+  'objc',
   'yaml',
   'twig',
+  'xml',
+  'properties',
   'unknown',
 ] as const;
 
@@ -308,6 +312,15 @@ export interface Subgraph {
 
   /** Root node IDs (entry points) */
   roots: string[];
+
+  /**
+   * Retrieval confidence for context-style queries. `'low'` means the query
+   * resolved only to isolated common-word matches (no entry point corroborated
+   * by 2+ distinct query terms) — callers should surface an honest handoff to
+   * explore/trace rather than present the results as comprehensive. Undefined
+   * for graph traversals that don't run the search-ranking path.
+   */
+  confidence?: 'high' | 'low';
 }
 
 /**

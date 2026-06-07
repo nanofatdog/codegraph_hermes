@@ -16,10 +16,13 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference } from './name-matcher';
-import { resolveViaImport, extractImportMappings, extractReExports } from './import-resolver';
+import { matchReference, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs } from './import-resolver';
 import { detectFrameworks } from './frameworks';
+import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
+import { loadGoModule, type GoModule } from './go-module';
+import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
@@ -129,6 +132,49 @@ const PASCAL_BUILT_INS = new Set([
   'IInterface', 'IUnknown',
 ]);
 
+const C_BUILT_INS = new Set([
+  // Standard C library functions
+  'printf', 'fprintf', 'sprintf', 'snprintf', 'scanf', 'fscanf', 'sscanf',
+  'malloc', 'calloc', 'realloc', 'free',
+  'memcpy', 'memmove', 'memset', 'memcmp', 'memchr',
+  'strlen', 'strcpy', 'strncpy', 'strcat', 'strncat', 'strcmp', 'strncmp',
+  'strstr', 'strchr', 'strrchr', 'strtok', 'strdup',
+  'fopen', 'fclose', 'fread', 'fwrite', 'fgets', 'fputs', 'fputc', 'fgetc',
+  'feof', 'ferror', 'fflush', 'fseek', 'ftell', 'rewind',
+  'exit', 'abort', 'atexit', 'atoi', 'atol', 'atof', 'strtol', 'strtoul', 'strtod',
+  'qsort', 'bsearch',
+  'abs', 'labs', 'rand', 'srand',
+  'sin', 'cos', 'tan', 'sqrt', 'pow', 'log', 'log10', 'exp', 'ceil', 'floor', 'fabs',
+  'time', 'clock', 'difftime', 'mktime', 'localtime', 'gmtime', 'strftime', 'asctime',
+  'assert', 'errno',
+  'perror', 'remove', 'rename', 'tmpfile', 'tmpnam',
+  'getenv', 'system',
+  'signal', 'raise',
+  'setjmp', 'longjmp',
+  'va_start', 'va_end', 'va_arg', 'va_copy',
+  'NULL', 'EOF', 'BUFSIZ', 'FILENAME_MAX', 'RAND_MAX', 'EXIT_SUCCESS', 'EXIT_FAILURE',
+  'size_t', 'ptrdiff_t', 'wchar_t', 'intptr_t', 'uintptr_t',
+  'int8_t', 'int16_t', 'int32_t', 'int64_t',
+  'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+  'FILE',
+  // POSIX additions commonly seen
+  'stat', 'lstat', 'fstat', 'open', 'close', 'read', 'write', 'pipe',
+  'fork', 'exec', 'waitpid', 'getpid', 'getppid', 'kill', 'sleep', 'usleep',
+  'pthread_create', 'pthread_join', 'pthread_mutex_lock', 'pthread_mutex_unlock',
+  'dlopen', 'dlsym', 'dlclose',
+]);
+
+const CPP_BUILT_INS = new Set([
+  // iostream objects (often used without std:: prefix via using)
+  'cout', 'cin', 'cerr', 'clog', 'endl', 'flush', 'ws',
+  'std', // the namespace itself when used as std::something
+  // Common C++ keywords that leak as references
+  'nullptr', 'true', 'false', 'this', 'sizeof', 'alignof', 'typeid',
+  'static_cast', 'dynamic_cast', 'reinterpret_cast', 'const_cast',
+  'make_unique', 'make_shared', 'make_pair',
+  'move', 'forward', 'swap',
+]);
+
 /**
  * Reference Resolver
  *
@@ -139,6 +185,10 @@ export class ReferenceResolver {
   private queries: QueryBuilder;
   private context: ResolutionContext;
   private frameworks: FrameworkResolver[] = [];
+  // Per-`.razor`/`.cshtml`-file `@using` namespace set (own directives + folder
+  // `_Imports.razor`, cascading to the project root). Used to disambiguate a
+  // markup type ref to the right C# namespace.
+  private razorUsingsCache = new Map<string, string[]>();
   // All per-resolver caches are LRU-bounded. Previously these were
   // unbounded Maps that grew with every distinct lookup and OOM'd on
   // codebases with 20k+ files (see issue: unbounded cache growth).
@@ -156,6 +206,10 @@ export class ReferenceResolver {
   // `null` = computed and absent. Treated as immutable for the
   // resolver's lifetime; callers re-create the resolver if config changes.
   private projectAliases: AliasMap | null | undefined = undefined;
+  // go.mod module path. Same lazy/immutable convention as projectAliases.
+  private goModule: GoModule | null | undefined = undefined;
+  // Monorepo workspace member packages. Same lazy/immutable convention.
+  private workspacePackages: WorkspacePackages | null | undefined = undefined;
 
   constructor(projectRoot: string, queries: QueryBuilder) {
     this.projectRoot = projectRoot;
@@ -182,6 +236,35 @@ export class ReferenceResolver {
   initialize(): void {
     this.frameworks = detectFrameworks(this.context);
     this.clearCaches();
+  }
+
+  /**
+   * Run each framework resolver's cross-file finalization pass and persist
+   * the returned node updates. Idempotent — safe to call after every indexAll
+   * and every incremental sync. Returns the number of nodes updated.
+   *
+   * Caches are cleared before/after so the post-extract pass sees fresh DB
+   * state and downstream queries see the updated names.
+   */
+  runPostExtract(): number {
+    let updated = 0;
+    this.clearCaches();
+    for (const fw of this.frameworks) {
+      if (!fw.postExtract) continue;
+      try {
+        const nodes = fw.postExtract(this.context);
+        for (const node of nodes) {
+          this.queries.updateNode(node);
+          updated++;
+        }
+      } catch (err) {
+        logDebug(`Framework '${fw.name}' postExtract failed`, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    if (updated > 0) this.clearCaches();
+    return updated;
   }
 
   /**
@@ -340,6 +423,20 @@ export class ReferenceResolver {
         return this.projectAliases;
       },
 
+      getGoModule: () => {
+        if (this.goModule === undefined) {
+          this.goModule = loadGoModule(this.projectRoot);
+        }
+        return this.goModule;
+      },
+
+      getWorkspacePackages: () => {
+        if (this.workspacePackages === undefined) {
+          this.workspacePackages = loadWorkspacePackages(this.projectRoot);
+        }
+        return this.workspacePackages;
+      },
+
       getReExports: (filePath: string, language) => {
         const cached = this.reExportCache.get(filePath);
         if (cached) return cached;
@@ -348,9 +445,21 @@ export class ReferenceResolver {
           this.reExportCache.set(filePath, []);
           return [];
         }
-        const reExports = extractReExports(content, language);
+        // Re-exports are a JS/TS-only construct, and what matters is the
+        // BARREL file's own language — not the consuming reference's. A
+        // `.svelte`/`.vue` consumer threads its own language down the
+        // re-export chase, which would make extractReExports() bail on a
+        // `.ts` index barrel and silently break the chain (#629). Re-key
+        // the parse on the barrel's extension so the chase works no matter
+        // what kind of file imports through it.
+        const isJsFamily = /\.(?:d\.ts|[cm]?tsx?|[cm]?jsx?)$/i.test(filePath);
+        const reExports = extractReExports(content, isJsFamily ? 'typescript' : language);
         this.reExportCache.set(filePath, reExports);
         return reExports;
+      },
+
+      getCppIncludeDirs: () => {
+        return loadCppIncludeDirs(this.projectRoot);
       },
     };
   }
@@ -441,12 +550,30 @@ export class ReferenceResolver {
       // Also check capitalized receiver (instance-method resolution)
       const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
       if (this.knownNames.has(capitalized)) return true;
+      // JVM FQN: `com.example.foo.Bar` — the only useful segment is the
+      // last one (`Bar`); the earlier check finds `example.foo.Bar` which
+      // never matches a node name.
+      const lastDot = name.lastIndexOf('.');
+      if (lastDot > dotIdx) {
+        const tail = name.substring(lastDot + 1);
+        if (tail && this.knownNames.has(tail)) return true;
+      }
     }
     const colonIdx = name.indexOf('::');
     if (colonIdx > 0) {
       const receiver = name.substring(0, colonIdx);
       const member = name.substring(colonIdx + 2);
       if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      // Multi-segment path `a::b::c` (a Rust/C++ module call like
+      // `database::profiles::find`) — the only segment that names a symbol is
+      // the last (`c`); `member` above is `b::c`, which never matches a node
+      // name, so without this the pre-filter drops the ref before the Rust path
+      // resolver ever sees it. Mirror the dotted-name leaf check above.
+      const lastColon = name.lastIndexOf('::');
+      if (lastColon > colonIdx) {
+        const tail = name.substring(lastColon + 2);
+        if (tail && this.knownNames.has(tail)) return true;
+      }
     }
 
     // For path-like references (e.g., "snippets/drawer-menu.liquid"), check the filename
@@ -493,15 +620,39 @@ export class ReferenceResolver {
     // from './barrel'` where the barrel has `export { signIn as login }
     // from './auth'`) intentionally call a name that has no
     // declaration anywhere — only the renamed upstream symbol does.
-    if (!this.hasAnyPossibleMatch(ref.referenceName) && !this.matchesAnyImport(ref)) {
+    if (
+      !this.hasAnyPossibleMatch(ref.referenceName) &&
+      !this.matchesAnyImport(ref) &&
+      !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))
+    ) {
       return null;
+    }
+
+    // JVM FQN imports skip framework/name-matcher: `import com.example.Bar`
+    // resolves directly through the qualifiedName index, which is unambiguous
+    // even when several `Bar` classes exist in different packages.
+    const jvmImport = resolveJvmImport(ref, this.context);
+    if (jvmImport) return jvmImport;
+
+    // Razor/Blazor: a markup or `@code` type ref resolves through the file's
+    // `@using` namespaces (incl. folder `_Imports.razor`). This precisely
+    // disambiguates a simple name that exists in several namespaces — e.g.
+    // `CatalogBrand` resolving to `BlazorShared.Models::CatalogBrand` (the DTO,
+    // which the `.razor` `@using`s) rather than the same-named domain entity.
+    if (ref.language === 'razor') {
+      const razorResult = this.resolveRazorUsing(ref);
+      if (razorResult) return razorResult;
     }
 
     const candidates: ResolvedRef[] = [];
 
-    // Strategy 1: Try framework-specific resolution
+    // Strategy 1: Try framework-specific resolution. Cross-language bridges
+    // are deliberately preserved (Drupal `routing.yml` → PHP controller, RN
+    // JS → native `calls`) — `gateFrameworkLanguage` only drops a type/import
+    // edge between two KNOWN families (see its doc), never a `calls` bridge or
+    // a config↔code edge.
     for (const framework of this.frameworks) {
-      const result = framework.resolve(ref, this.context);
+      const result = this.gateFrameworkLanguage(framework.resolve(ref, this.context), ref);
       if (result) {
         if (result.confidence >= 0.9) return result; // High confidence, return immediately
         candidates.push(result);
@@ -509,14 +660,14 @@ export class ReferenceResolver {
     }
 
     // Strategy 2: Try import-based resolution
-    const importResult = resolveViaImport(ref, this.context);
+    const importResult = this.gateLanguage(resolveViaImport(ref, this.context), ref);
     if (importResult) {
       if (importResult.confidence >= 0.9) return importResult;
       candidates.push(importResult);
     }
 
     // Strategy 3: Try name matching
-    const nameResult = matchReference(ref, this.context);
+    const nameResult = this.gateLanguage(matchReference(ref, this.context), ref);
     if (nameResult) {
       candidates.push(nameResult);
     }
@@ -681,6 +832,16 @@ export class ReferenceResolver {
       }
     }
 
+    // Dynamic-edge synthesis: now that all base `calls` edges are persisted,
+    // synthesize observer/callback dispatch edges (dispatcher → registered
+    // callbacks) that static parsing leaves out. Best-effort — never fail the
+    // index on it. See docs/design/callback-edge-synthesis.md.
+    try {
+      aggregateStats.byMethod['callback-synthesis'] = synthesizeCallbackEdges(this.queries, this.context);
+    } catch {
+      // synthesis is additive and optional; ignore failures
+    }
+
     return {
       resolved: [],
       unresolved: [],
@@ -743,7 +904,13 @@ export class ReferenceResolver {
           }
         }
       }
-      if (PYTHON_BUILT_IN_METHODS.has(name)) {
+      // A bare name colliding with a builtin method (index, get, update, count…)
+      // is only a builtin when NOTHING in the codebase declares it. A declared
+      // symbol with that exact name — e.g. a Flask/FastAPI view `def index()` or
+      // `def get()` — is a real reference target. Mirrors the knownNames guard on
+      // the dotted branch above; without it, every handler named after a builtin
+      // method silently loses its route→handler edge.
+      if (PYTHON_BUILT_IN_METHODS.has(name) && !this.knownNames?.has(name)) {
         return true;
       }
     }
@@ -772,6 +939,24 @@ export class ReferenceResolver {
       }
     }
 
+    // C/C++ standard library symbols (printf, malloc, std::vector, etc.).
+    // Names that collide with user-defined symbols are NOT filtered —
+    // C and C++ projects routinely shadow stdlib names (custom allocators
+    // define `malloc`/`free`, stream wrappers define `read`/`write`/`open`,
+    // containers define `move`/`swap`, logging libs wrap `printf`). Killing
+    // those resolutions makes the graph wrong, not cleaner. We only filter
+    // when there's no user node with this name — then name-matching would
+    // produce zero edges anyway and the filter just short-circuits work.
+    if (ref.language === 'c' || ref.language === 'cpp') {
+      // C++ std:: namespace prefix — safe to filter unconditionally,
+      // since `std::foo` is never a user-defined qualified name in
+      // tree-sitter output.
+      if (name.startsWith('std::')) return true;
+      if (C_BUILT_INS.has(name) || CPP_BUILT_INS.has(name)) {
+        return !this.hasAnyPossibleMatch(name);
+      }
+    }
+
     return false;
   }
 
@@ -789,6 +974,97 @@ export class ReferenceResolver {
   private getLanguageFromNodeId(nodeId: string): UnresolvedRef['language'] {
     const node = this.queries.getNodeById(nodeId);
     return node?.language || 'unknown';
+  }
+
+  /**
+   * Drop an import/name-strategy resolution that crosses a language family.
+   * Two regimes (mirrors `applyLanguageGate`'s candidate filter):
+   *  - `references` (type usage): STRICT — a `Type.member` static read names a
+   *    same-family type, never a coincidentally same-named symbol in another
+   *    language. Drops any non-same-family target.
+   *  - `imports` (import binding / `#include`): both-known — a C++ `#include
+   *    "X.h"` must not resolve to a same-named ObjC header on another platform
+   *    (basename collision), but a singleton-family / SFC language (`vue` →
+   *    `.ts`) importing across is left alone.
+   * Applies to the import (strategy 2) + name-match (strategy 3) results.
+   */
+  /**
+   * Collect the `@using` namespaces in scope for a `.razor`/`.cshtml` file: its
+   * own `@using` directives plus every `_Imports.razor` from the file's folder up
+   * to the project root (Razor `_Imports` cascade). Cached per file.
+   */
+  private getRazorUsings(filePath: string): string[] {
+    const cached = this.razorUsingsCache.get(filePath);
+    if (cached) return cached;
+    const usings = new Set<string>();
+    const addFrom = (src: string | null): void => {
+      if (!src) return;
+      for (const m of src.matchAll(/^\s*@using\s+(?:static\s+)?([A-Za-z_][\w.]*)/gm)) usings.add(m[1]!);
+    };
+    addFrom(this.context.readFile(filePath));
+    let dir = filePath.includes('/') ? filePath.slice(0, filePath.lastIndexOf('/')) : '';
+    // Walk up to the project root, reading each level's _Imports.razor.
+    for (;;) {
+      addFrom(this.context.readFile(dir ? `${dir}/_Imports.razor` : '_Imports.razor'));
+      if (!dir) break;
+      const slash = dir.lastIndexOf('/');
+      dir = slash >= 0 ? dir.slice(0, slash) : '';
+    }
+    const arr = [...usings];
+    this.razorUsingsCache.set(filePath, arr);
+    return arr;
+  }
+
+  /**
+   * Resolve a Razor/Blazor simple type ref through the file's `@using`
+   * namespaces: `CatalogBrand` + `@using BlazorShared.Models` → the node whose
+   * qualified name is `BlazorShared.Models::CatalogBrand`. Only resolves when the
+   * `@using` set yields exactly ONE type (otherwise it stays ambiguous and falls
+   * through to name-matching).
+   */
+  private resolveRazorUsing(ref: UnresolvedRef): ResolvedRef | null {
+    if (ref.referenceName.includes('.') || ref.referenceName.includes('::')) return null;
+    const usings = this.getRazorUsings(ref.filePath);
+    if (usings.length === 0) return null;
+    const found = new Map<string, Node>();
+    for (const ns of usings) {
+      for (const cand of this.context.getNodesByQualifiedName(`${ns}::${ref.referenceName}`)) {
+        found.set(cand.id, cand);
+      }
+    }
+    if (found.size !== 1) return null;
+    const target = found.values().next().value!;
+    return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
+  }
+
+  private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+    if (!result) return result;
+    const tgt = this.getLanguageFromNodeId(result.targetNodeId);
+    if (!tgt || !ref.language) return result;
+    if (ref.referenceKind === 'references' && !sameLanguageFamily(tgt, ref.language)) return null;
+    if (ref.referenceKind === 'imports' && crossesKnownFamily(tgt, ref.language)) return null;
+    return result;
+  }
+
+  /**
+   * Drop a FRAMEWORK-strategy resolution that crosses two *known* language
+   * families for a type-usage (`references`) or import-binding (`imports`)
+   * edge. The framework strategy is intentionally ungated for cross-language
+   * bridges, but those legitimate bridges are either `calls` edges (RN/Expo
+   * JS → native) or config↔code edges whose config side (`yaml`/`blade`/…) is
+   * not a known programming-language family. A `references`/`imports` edge
+   * between two *known* families is always a coincidental name collision — the
+   * React/Svelte/Vue PascalCase component resolvers name-match `getNodesByName`
+   * without a language check, so a TS `<TestRunner>` ref happily matched a
+   * Kotlin `class TestRunner`. Gating only the both-known-cross-family case
+   * lets config bridges and `calls` bridges through untouched.
+   */
+  private gateFrameworkLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+    if (!result) return result;
+    if (ref.referenceKind !== 'references' && ref.referenceKind !== 'imports') return result;
+    const tgt = this.getLanguageFromNodeId(result.targetNodeId);
+    if (tgt && ref.language && crossesKnownFamily(tgt, ref.language)) return null;
+    return result;
   }
 }
 

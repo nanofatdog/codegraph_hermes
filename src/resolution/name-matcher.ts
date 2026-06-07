@@ -15,7 +15,13 @@ export function matchByFilePath(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  if (!ref.referenceName.includes('/')) return null;
+  // Path-like (`a/b.liquid`) OR a bare filename ending in a short extension
+  // (`Foo.h` — an Objective-C `#import "Foo.h"`, resolved to the header by
+  // basename). A bare ref WITHOUT an extension is a symbol name, not a file, so
+  // leave it to the symbol-matching strategies.
+  if (!ref.referenceName.includes('/') && !/\.[A-Za-z][A-Za-z0-9]{0,3}$/.test(ref.referenceName)) {
+    return null;
+  }
 
   // Extract the filename from the path
   const fileName = ref.referenceName.split('/').pop();
@@ -38,12 +44,20 @@ export function matchByFilePath(
     };
   }
 
-  // Fall back to suffix match (e.g., ref="snippets/foo.liquid" matches "src/snippets/foo.liquid")
-  const suffixMatch = fileNodes.find(n => n.qualifiedName.endsWith(ref.referenceName) || n.filePath.endsWith(ref.referenceName));
-  if (suffixMatch) {
+  // Fall back to suffix match (e.g., ref="snippets/foo.liquid" matches
+  // "src/snippets/foo.liquid"). When several files share the basename — a
+  // `#include "RNCAsyncStorage.h"` with a same-named header on another platform
+  // (windows/code/ vs apple/) — prefer the one in the includer's own directory,
+  // then by directory proximity / same language family. A C/C++ include (and any
+  // bare-filename import) resolves relative to the including file, not to an
+  // arbitrary same-named header elsewhere in the tree.
+  const suffixMatches = fileNodes.filter(
+    n => n.qualifiedName.endsWith(ref.referenceName) || n.filePath.endsWith(ref.referenceName)
+  );
+  if (suffixMatches.length > 0) {
     return {
       original: ref,
-      targetNodeId: suffixMatch.id,
+      targetNodeId: pickClosestFileNode(suffixMatches, ref).id,
       confidence: 0.85,
       resolvedBy: 'file-path',
     };
@@ -63,13 +77,104 @@ export function matchByFilePath(
 }
 
 /**
+ * Among several file nodes that all match a bare include/import by basename,
+ * pick the one closest to the referencing file: same directory first, then by
+ * directory-tree proximity, with the same language family as a tiebreak. A
+ * C/C++ `#include "X.h"` (and any bare-filename import) resolves relative to the
+ * including file — not to an arbitrary same-named header on another platform.
+ */
+function pickClosestFileNode(candidates: Node[], ref: UnresolvedRef): Node {
+  const dirOf = (p: string): string => {
+    const i = p.lastIndexOf('/');
+    return i >= 0 ? p.slice(0, i) : '';
+  };
+  const refDir = dirOf(ref.filePath);
+  const sameDir = candidates.filter((c) => dirOf(c.filePath) === refDir);
+  const pool = sameDir.length > 0 ? sameDir : candidates;
+  let best = pool[0]!;
+  let bestScore = -Infinity;
+  for (const c of pool) {
+    const score =
+      computePathProximity(ref.filePath, c.filePath) +
+      (sameLanguageFamily(c.language, ref.language) ? 5 : 0);
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+  return best;
+}
+
+/**
+ * Language families that share a type system / runtime, so a same-language-only
+ * reference may still resolve across them (a Kotlin `Foo.BAR` can name a Java
+ * `Foo`). Anything not listed forms its own singleton family.
+ */
+const LANGUAGE_FAMILY: Record<string, string> = {
+  java: 'jvm', kotlin: 'jvm', scala: 'jvm',
+  swift: 'apple', objc: 'apple',
+  typescript: 'web', tsx: 'web', javascript: 'web', jsx: 'web',
+  c: 'c', cpp: 'c',
+  // Razor/Blazor markup names C# types — same family so `@model Foo` /
+  // `<MyComponent/>` resolve to their `.cs` class through the cross-family gate.
+  csharp: 'dotnet', razor: 'dotnet',
+};
+export function sameLanguageFamily(a: string, b: string): boolean {
+  if (a === b) return true;
+  const fa = LANGUAGE_FAMILY[a];
+  return fa !== undefined && fa === LANGUAGE_FAMILY[b];
+}
+/**
+ * True when `lang` belongs to a known multi-language family (jvm/apple/web/c).
+ * Languages not listed (php, python, go, ruby, rust, dart, …) and config
+ * formats (yaml/xml/blade) form their own singleton families and return
+ * `false` — used to leave config↔code framework bridges (whose config side is
+ * never a known programming-language family) out of the cross-family gate.
+ */
+export function isKnownLanguageFamily(lang: string): boolean {
+  return LANGUAGE_FAMILY[lang] !== undefined;
+}
+/**
+ * True when `a` and `b` are two DIFFERENT *known* language families — the
+ * signature of a coincidental cross-language name collision (a TS `import
+ * React` matching a Swift `import React`, a C++ `#include "X.h"` matching a
+ * same-named ObjC header on another platform). The both-*known* test is
+ * deliberately weaker than {@link sameLanguageFamily}'s negation: a
+ * single-file-component language that carries its own tag (`vue`/`svelte`)
+ * importing a `.ts` module, or any singleton-family language (php/go/ruby/…),
+ * returns `false` here and is left alone.
+ */
+export function crossesKnownFamily(a: string, b: string): boolean {
+  return isKnownLanguageFamily(a) && isKnownLanguageFamily(b) && !sameLanguageFamily(a, b);
+}
+/**
+ * Drop cross-language candidates from a name lookup. Two regimes:
+ *  - `references` (type-usage): a type named in language X resolves to a
+ *    SAME-family type, never a coincidentally same-named symbol in another
+ *    language (the Android `BatteryManager` system class vs a JS one). Strict
+ *    same-family filter — cross-language communication is `calls`, not refs.
+ *  - `imports` (import binding): an `import`/`#include` never crosses two
+ *    KNOWN families (TS `import React` ↮ Swift `import React`). Weaker
+ *    both-known filter so `.vue`/`.svelte` (own tag) importing `.ts` survives.
+ */
+function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
+  if (ref.referenceKind === 'references') {
+    return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
+  }
+  if (ref.referenceKind === 'imports') {
+    return candidates.filter((c) => !crossesKnownFamily(c.language, ref.language));
+  }
+  return candidates;
+}
+
+/**
  * Try to resolve a reference by exact name match
  */
 export function matchByExactName(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  const candidates = context.getNodesByName(ref.referenceName);
+  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref);
 
   if (candidates.length === 0) {
     return null;
@@ -146,6 +251,210 @@ export function matchByQualifiedName(
   return null;
 }
 
+function resolveMethodOnType(
+  typeName: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  confidence: number,
+  resolvedBy: ResolvedRef['resolvedBy'],
+  /**
+   * Optional FQN that identifies WHICH class declaration `typeName`
+   * refers to in the caller's file. When multiple candidates share
+   * the same qualifiedName (`FooConverter::convert` in both
+   * `dao/converter/` and `service/converter/`), the FQN's
+   * file-path-suffix picks the right one — the disambiguation
+   * signal Java imports carry but the call site doesn't (#314).
+   */
+  preferredFqn?: string,
+): ResolvedRef | null {
+  // Look up methods by name and match by qualifiedName ending in
+  // `<typeName>::<methodName>`. This works whether the method is defined
+  // in-class (`class Foo { int bar() { ... } }`) or out-of-line in a separate
+  // file (`int Foo::bar() { ... }` in foo.cpp while class Foo is in foo.hpp).
+  // The previous same-file approach missed the latter — the typical C++ layout.
+  const methodCandidates = context.getNodesByName(methodName);
+  const want = `${typeName}::${methodName}`;
+  const matches: Node[] = [];
+  for (const m of methodCandidates) {
+    if (m.kind !== 'method') continue;
+    if (m.language !== ref.language) continue;
+    const qn = m.qualifiedName;
+    if (qn === want || qn.endsWith(`::${want}`)) {
+      matches.push(m);
+    }
+  }
+  if (matches.length === 0) return null;
+
+  if (matches.length > 1 && preferredFqn) {
+    const ext = ref.language === 'kotlin' ? '.kt' : '.java';
+    const fqnPath = preferredFqn.replace(/\./g, '/') + ext;
+    const chosen = matches.find((m) => {
+      const fp = m.filePath.replace(/\\/g, '/');
+      return fp.endsWith(fqnPath) || fp.endsWith('/' + fqnPath);
+    });
+    if (chosen) {
+      return {
+        original: ref,
+        targetNodeId: chosen.id,
+        confidence,
+        resolvedBy,
+      };
+    }
+  }
+
+  return {
+    original: ref,
+    targetNodeId: matches[0]!.id,
+    confidence,
+    resolvedBy,
+  };
+}
+
+// C++ keywords/control-flow tokens that can appear right before a receiver
+// (e.g. `return ptr->m()`) and must NOT be treated as a type.
+const CPP_NON_TYPE_TOKENS = new Set([
+  'return', 'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'default',
+  'break', 'continue', 'goto', 'throw', 'new', 'delete', 'co_await', 'co_yield',
+  'co_return', 'static_cast', 'const_cast', 'dynamic_cast', 'reinterpret_cast',
+  'sizeof', 'alignof', 'typeid', 'and', 'or', 'not', 'xor',
+]);
+
+function normalizeCppTypeName(typeName: string): string | null {
+  const normalized = typeName
+    .replace(/\b(const|volatile|mutable|typename|class|struct)\b/g, ' ')
+    .replace(/[&*]+/g, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!normalized) return null;
+  const parts = normalized.split(/::/).filter(Boolean);
+  const last = parts[parts.length - 1];
+  if (!last) return null;
+  if (CPP_NON_TYPE_TOKENS.has(last)) return null;
+  return last;
+}
+
+// Declarator regex: matches `Type receiver`, `Type* receiver`, `Type *receiver`,
+// `Type*receiver`, `Type<X> receiver`, etc., REQUIRING a declarator terminator
+// (`;`, `=`, `,`, `)`, `[`, `{`, `(`, or end-of-line) after the receiver. The
+// terminator rules out uses like `return receiver->m()` where the preceding
+// token is a keyword, not a type.
+function buildDeclaratorRegex(escapedReceiver: string): RegExp {
+  return new RegExp(
+    `([A-Za-z_][\\w:]*(?:\\s*<[^;=(){}]+>)?(?:\\s*[*&]+)?)\\s*\\b${escapedReceiver}\\b\\s*(?=[;=,)\\[{(]|$)`,
+  );
+}
+
+function inferCppReceiverType(
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const source = context.readFile(ref.filePath);
+  if (!source) return null;
+
+  const lines = source.split(/\r?\n/);
+  const callLineIndex = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
+  const escapedReceiver = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const receiverPattern = new RegExp(`\\b${escapedReceiver}\\b`);
+  const declaratorRegex = buildDeclaratorRegex(escapedReceiver);
+
+  for (let i = callLineIndex; i >= 0; i--) {
+    const line = lines[i];
+    if (!line || !receiverPattern.test(line)) continue;
+
+    const declaratorMatch = line.match(declaratorRegex);
+    if (declaratorMatch) {
+      const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
+      if (normalized) return normalized;
+    }
+  }
+
+  const headerCandidates = [
+    ref.filePath.replace(/\.(?:c|cc|cpp|cxx)$/i, '.h'),
+    ref.filePath.replace(/\.(?:c|cc|cpp|cxx)$/i, '.hpp'),
+    ref.filePath.replace(/\.(?:c|cc|cpp|cxx)$/i, '.hxx'),
+  ].filter((candidate, index, arr) => arr.indexOf(candidate) === index && candidate !== ref.filePath);
+
+  for (const headerPath of headerCandidates) {
+    if (!context.fileExists(headerPath)) continue;
+    const headerSource = context.readFile(headerPath);
+    if (!headerSource) continue;
+
+    for (const line of headerSource.split(/\r?\n/)) {
+      if (!receiverPattern.test(line)) continue;
+      const declaratorMatch = line.match(declaratorRegex);
+      if (!declaratorMatch) continue;
+      const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
+      if (normalized) return normalized;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Java/Kotlin: infer a receiver's declared type by walking field declarations
+ * in the class enclosing the call site. The field's `signature` is already in
+ * the form "<TypeName> <fieldName>" (set by tree-sitter.ts extractField), so we
+ * pull the type from there. Handles Spring `@Resource UserBO userbo;` /
+ * `@Autowired private UserService userService;` where the receiver field name
+ * doesn't match the class name by Java naming convention.
+ *
+ * Returns the bare type name (generics stripped, dotted package stripped) or
+ * null when no matching field is in the enclosing class.
+ */
+function inferJavaFieldReceiverType(
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const inFile = context.getNodesInFile(ref.filePath);
+  if (inFile.length === 0) return null;
+
+  // Find the class enclosing the call line (tightest match by latest start).
+  let enclosing: Node | null = null;
+  for (const n of inFile) {
+    if (n.kind !== 'class' && n.kind !== 'interface') continue;
+    if (n.language !== ref.language) continue;
+    const end = n.endLine ?? n.startLine;
+    if (n.startLine <= ref.line && end >= ref.line) {
+      if (!enclosing || n.startLine >= enclosing.startLine) enclosing = n;
+    }
+  }
+  if (!enclosing) return null;
+
+  const enclosingEnd = enclosing.endLine ?? enclosing.startLine;
+  const field = inFile.find(
+    (n) =>
+      n.kind === 'field' &&
+      n.name === receiverName &&
+      n.language === ref.language &&
+      n.startLine >= enclosing.startLine &&
+      (n.endLine ?? n.startLine) <= enclosingEnd,
+  );
+  if (!field || !field.signature) return null;
+
+  // Signature shape: "<TypeName> <fieldName>" (extractField). Pull the type,
+  // strip generics + dotted package, drop array/varargs markers.
+  const beforeName = field.signature.slice(
+    0,
+    field.signature.lastIndexOf(field.name),
+  );
+  const typeRaw = beforeName.trim();
+  if (!typeRaw) return null;
+
+  const typeNoGenerics = typeRaw.replace(/<[^>]*>/g, '').trim();
+  const typeNoArray = typeNoGenerics.replace(/\[\s*\]/g, '').replace(/\.\.\.$/, '').trim();
+  const parts = typeNoArray.split(/[.\s]+/).filter(Boolean);
+  const lastPart = parts[parts.length - 1];
+  if (!lastPart) return null;
+  if (!/^[A-Z]/.test(lastPart)) return null; // primitives / lowercase → skip
+  return lastPart;
+}
+
 /**
  * Try to resolve by method name on a class/object
  */
@@ -153,8 +462,16 @@ export function matchMethodCall(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  // Parse method call patterns like "obj.method" or "Class::method"
-  const dotMatch = ref.referenceName.match(/^(\w+)\.(\w+)$/);
+  // Parse method call patterns like "obj.method" or "Class::method". The method
+  // part allows trailing `:` keywords so Objective-C selectors resolve
+  // (`SDImageCache.storeImage:`, `obj.setX:y:`); colons never appear in other
+  // languages' method refs, so this is a no-op for them.
+  // The receiver allows dots (`builder.Services.AddCoreServices`) so a CHAINED
+  // call resolves by its last segment — Strategy 3 below name-matches the method
+  // (with its existing single-candidate / receiver-overlap guards). Without this
+  // a multi-dot extension-method call (C# DI `builder.Services.AddCoreServices()`,
+  // `Guard.Against.X()`) matched no pattern and never resolved.
+  const dotMatch = ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/);
   const colonMatch = ref.referenceName.match(/^(\w+)::(\w+)$/);
 
   const match = dotMatch || colonMatch;
@@ -163,6 +480,51 @@ export function matchMethodCall(
   }
 
   const [, objectOrClass, methodName] = match;
+
+  if (ref.language === 'cpp' && dotMatch) {
+    const inferredType = inferCppReceiverType(objectOrClass!, ref, context);
+    if (inferredType) {
+      const typedMatch = resolveMethodOnType(
+        inferredType,
+        methodName!,
+        ref,
+        context,
+        0.9,
+        'instance-method',
+      );
+      if (typedMatch) {
+        return typedMatch;
+      }
+    }
+  }
+
+  // Java/Kotlin: receiver may be a field whose name doesn't match the type by
+  // Java naming convention (`userbo` → class `UserBO`, abbreviated). Look up
+  // the field in the enclosing class to get its declared type, then resolve
+  // the method on that type. Covers Spring `@Resource`/`@Autowired` field
+  // injection where the field type is the concrete bean class.
+  if ((ref.language === 'java' || ref.language === 'kotlin') && dotMatch) {
+    const inferredType = inferJavaFieldReceiverType(objectOrClass!, ref, context);
+    if (inferredType) {
+      // When two classes share the same simple name, the caller file's
+      // import is the only signal that names WHICH one — pass the
+      // imported FQN so resolveMethodOnType can disambiguate (#314).
+      const imports = context.getImportMappings(ref.filePath, ref.language);
+      const importedFqn = imports.find((i) => i.localName === inferredType)?.source;
+      const typedMatch = resolveMethodOnType(
+        inferredType,
+        methodName!,
+        ref,
+        context,
+        0.9,
+        'instance-method',
+        importedFqn,
+      );
+      if (typedMatch) {
+        return typedMatch;
+      }
+    }
+  }
 
   // Strategy 1: Direct class name match (existing logic)
   const classCandidates = context.getNodesByName(objectOrClass!);
@@ -410,7 +772,7 @@ export function matchFuzzy(
 
   // Filter to callable kinds only (function, method, class)
   const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind));
+  const callableCandidates = applyLanguageGate(candidates.filter((n) => callableKinds.has(n.kind)), ref);
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
