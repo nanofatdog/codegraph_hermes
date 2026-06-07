@@ -21,6 +21,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.repository == 'colbymchenry/codegraph'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -32,6 +33,7 @@ jobs:
           node-version: 22
 
   deploy:
+    if: github.repository == 'colbymchenry/codegraph'
     needs: build
     runs-on: ubuntu-latest
     environment:
