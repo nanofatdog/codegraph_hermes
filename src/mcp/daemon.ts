@@ -54,6 +54,7 @@ import {
   getDaemonSocketPath,
 } from './daemon-paths';
 import { CodeGraphPackageVersion } from './version';
+import { registerDaemon, deregisterDaemon } from './daemon-registry';
 
 /** Default idle linger after the last client disconnects. */
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
@@ -147,7 +148,12 @@ export class Daemon {
     this.pidPath = getDaemonPidPath(projectRoot);
     this.idleTimeoutMs = opts.idleTimeoutMs ?? resolveIdleTimeoutMs();
     this.maxIdleMs = opts.maxIdleMs ?? resolveMaxIdleMs();
-    this.engine = new MCPEngine();
+    // Daemon mode serves many concurrent clients on one event loop, so off-load
+    // read-tool dispatch to a worker pool — otherwise concurrent explores
+    // serialize and starve the MCP transport (clients time out). Direct mode
+    // (one stdio client) leaves the pool off; `CODEGRAPH_QUERY_POOL_SIZE=0`
+    // disables it here too.
+    this.engine = new MCPEngine({ queryPool: true });
     this.engine.setProjectPathHint(projectRoot);
   }
 
@@ -182,6 +188,19 @@ export class Daemon {
         this.server = server;
         resolve();
       });
+    }).catch((err) => {
+      // Bind failed — e.g. AF_UNIX is unsupported/unreliable on this filesystem
+      // (the WSL2 DrvFs hazard behind #974), or a stale socket we couldn't clear.
+      // We already hold the lockfile that `tryAcquireDaemonLock` wrote; release it
+      // and any partial socket so the NEXT launcher doesn't spin respawning us on
+      // a stale lock that points at our now-dying pid. Then re-throw so the caller
+      // (the bin's try/catch) exits this detached daemon cleanly and every
+      // launcher falls back to direct mode.
+      this.cleanupLockfile();
+      if (process.platform !== 'win32') {
+        try { fs.unlinkSync(this.socketPath); } catch { /* may not exist */ }
+      }
+      throw err;
     });
 
     const lock: DaemonLockInfo = {
@@ -190,6 +209,10 @@ export class Daemon {
       socketPath: this.socketPath,
       startedAt: Date.now(),
     };
+
+    // Drop a discovery record so `codegraph list` / `stop --all` can find us.
+    // Best-effort; a missing record only means list's liveness prune covers it.
+    registerDaemon({ root: this.projectRoot, ...lock });
 
     process.stderr.write(
       `[CodeGraph daemon] Listening on ${this.socketPath} (pid ${process.pid}, v${CodeGraphPackageVersion}). Idle timeout ${this.idleTimeoutMs}ms.\n`
@@ -244,6 +267,7 @@ export class Daemon {
     }
     this.engine.stop();
     this.cleanupLockfile();
+    deregisterDaemon(this.projectRoot);
     if (process.platform !== 'win32') {
       try { fs.unlinkSync(this.socketPath); } catch { /* may already be gone */ }
     }

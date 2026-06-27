@@ -49,15 +49,11 @@ import {
 } from './daemon';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
 import { getDaemonSocketPath } from './daemon-paths';
-import { supervisionLostReason } from './ppid-watchdog';
+import { getTelemetry } from '../telemetry';
+import { supervisionLostReason, parsePpidPollMs, parseHostPpid } from './ppid-watchdog';
+import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
+import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
-
-/**
- * How often to poll `process.ppid` to detect parent process death (see #277).
- * 5s is a deliberate trade-off: the failure mode being guarded against is rare
- * (parent SIGKILL'd), and longer poll = less wakeup overhead while idle.
- */
-const DEFAULT_PPID_POLL_MS = 5000;
 
 /**
  * Env var that marks a process as the *detached daemon* itself (set by
@@ -90,34 +86,6 @@ const TAKEOVER_RETRY_DELAY_MS = 100;
 // path, this narrows the "No such tool available" race window.
 const DAEMON_CONNECT_MAX_RETRIES = 240;
 const DAEMON_CONNECT_RETRY_DELAY_MS = 25;
-
-/**
- * Resolve the PPID watchdog poll interval from an env override. A value of
- * `0` disables the watchdog entirely (escape hatch for embedded scenarios
- * where the parent legitimately re-parents the server on purpose). Anything
- * non-numeric or negative falls back to the default.
- */
-function parsePpidPollMs(raw: string | undefined): number {
-  if (raw === undefined || raw === '') return DEFAULT_PPID_POLL_MS;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) return DEFAULT_PPID_POLL_MS;
-  if (parsed < 0) return DEFAULT_PPID_POLL_MS;
-  return Math.floor(parsed);
-}
-
-/**
- * Parse the host PID propagated across the `--liftoff-only` re-exec
- * ({@link HOST_PPID_ENV}). Returns a positive integer PID, or null when
- * unset/invalid — the direct-launch path, where the watchdog falls back to
- * `process.ppid` divergence. PIDs of 0/1 are rejected (0 = unknown, 1 = init,
- * i.e. already orphaned), so the watchdog doesn't latch onto init.
- */
-function parseHostPpid(raw: string | undefined): number | null {
-  if (raw === undefined || raw === '') return null;
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed <= 1) return null;
-  return parsed;
-}
 
 /** Whether `CODEGRAPH_NO_DAEMON` was set to a truthy value. */
 function daemonOptOutSet(): boolean {
@@ -218,6 +186,9 @@ export class MCPServer {
   private engine: MCPEngine | null = null;
   private daemon: Daemon | null = null;
   private ppidWatchdog: ReturnType<typeof setInterval> | null = null;
+  // Worker-thread liveness watchdog (#850). Long-lived modes only; SIGKILLs the
+  // process if the main thread wedges in a non-yielding sync loop.
+  private livenessWatchdog: WatchdogHandle | null = null;
   // PPID watchdog baseline — captured at construction so we always have a
   // baseline, even if start() runs after a fork-style reparent.
   private originalPpid: number = process.ppid;
@@ -244,6 +215,11 @@ export class MCPServer {
    * mode — a misbehaving daemon must never block a session from starting.
    */
   async start(): Promise<void> {
+    // Long-lived process (direct / proxy / daemon alike): flush buffered
+    // telemetry opportunistically. Fire-and-forget + unref'd — adds nothing
+    // to the handshake path and never keeps the process alive.
+    getTelemetry().startInterval();
+
     // The detached daemon process itself. Checked before the opt-out so the
     // daemon honors the same env it was spawned with (it never sets NO_DAEMON).
     if (daemonInternalSet()) {
@@ -293,6 +269,10 @@ export class MCPServer {
       clearInterval(this.ppidWatchdog);
       this.ppidWatchdog = null;
     }
+    if (this.livenessWatchdog) {
+      this.livenessWatchdog.stop();
+      this.livenessWatchdog = null;
+    }
     if (this.daemon) {
       void this.daemon.stop('stop()');
       // Daemon.stop calls process.exit; nothing else to do.
@@ -330,12 +310,15 @@ export class MCPServer {
     // Detect parent-process death — same logic as pre-refactor. When stdin
     // closes we go through StdioTransport's `process.exit(0)` already, but
     // SIGKILL of the parent doesn't reliably close stdin on Linux (#277).
-    process.stdin.on('end', () => this.stop());
-    process.stdin.on('close', () => this.stop());
+    // Also treat a stdin `'error'` (a socket-backed stdin can fail with
+    // ECONNRESET/hangup instead of a clean close) as shutdown, and destroy the
+    // stream so a hung fd can't busy-spin the event loop (#799).
+    treatStdinFailureAsShutdown(() => this.stop());
 
     this.mode = 'direct';
     this.installSignalHandlers();
     this.installPpidWatchdog();
+    this.livenessWatchdog = installMainThreadWatchdog();
   }
 
   /**
@@ -357,6 +340,10 @@ export class MCPServer {
         await daemon.start();
         this.daemon = daemon;
         this.mode = 'daemon';
+        // The detached daemon has no PPID watchdog or stdin lifeline, so a
+        // wedged main thread would pin a core forever (#850). The liveness
+        // watchdog is its only recovery path.
+        this.livenessWatchdog = installMainThreadWatchdog();
         return; // the net.Server keeps the process alive
       }
 
